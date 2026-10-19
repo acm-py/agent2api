@@ -141,6 +141,7 @@ impl<'a> CooldownKeys<'a> {
         self.for_provider(provider_of(account))
     }
 }
+
 /// 账号对某模型是否处于限额冷却期。
 ///
 /// 对应 Node 版 `isRateLimited(account, model, now)`：只认 `rateLimits[model].resetAt`
