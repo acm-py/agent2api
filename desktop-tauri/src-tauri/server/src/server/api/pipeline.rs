@@ -1239,6 +1239,7 @@ mod tests {
             status: None,
             start: None,
             end: None,
+            ..RequestQuery::default()
         };
         let page = stats.query_requests(&query);
         let entries = page.get("entries").and_then(Value::as_array);
