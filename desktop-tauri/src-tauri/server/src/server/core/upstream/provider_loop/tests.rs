@@ -189,20 +189,24 @@ fn stateful_quota_bookkeeping_ignores_non_quota_classes() {
 }
 
 #[test]
-fn codearts_daily_pool_envelope_cools_to_the_boundary_instead_of_ten_minutes() {
-    use crate::server::errors::GatewayError;
-
+fn daily_pool_quota_cools_to_the_boundary_instead_of_ten_minutes() {
     let (_dir, service, id) = temp_service();
-    // 生产库里那条真实文案（HTTP 200 的 SSE 里折出 403，首包门送进会话式分支）
-    let error = GatewayError::with_status(403, "上游报告 InferHub.4291.200：insufficient quota");
-    let class = adapter_for(ProviderKind::CodeArts).classify_conversation_error(&error);
-    let UpstreamErrorClass::QuotaLimited { reset_at: Some(reset_at), .. } = &class else {
-        panic!("福利池耗尽的文案应分类为带恢复时刻的 QuotaLimited，实际 {class:?}");
+    // CodeArts 分类实现已移入插件；本用例从插件返回的分类结果开始，
+    // 验证网关仍将日池恢复时刻原样落库，不依赖未安装插件的占位适配器。
+    let day_ms = 24 * 60 * 60 * 1000;
+    let offset_ms = i64::from(crate::server::core::beijing::OFFSET_SECONDS) * 1000;
+    let reset_at = ((logging::now_ms() + offset_ms) / day_ms + 1) * day_ms - offset_ms;
+    let message = "上游报告 InferHub.4291.200：insufficient quota";
+    let class = UpstreamErrorClass::QuotaLimited {
+        reset_at: Some(reset_at),
+        message: message.to_string(),
+        upstream_code: Some(4291200),
+        status: 403,
     };
-    mark_conversation_limited(&service, &id, &single("glm-5.3-flash"), &class, &error.message);
+    mark_conversation_limited(&service, &id, &single("glm-5.3-flash"), &class, message);
 
     let stored = rotate::account_limit_reset_at(&service, &id, "glm-5.3-flash");
-    assert_eq!(stored, *reset_at, "落库的恢复时刻必须是适配器算出的日池重置点");
+    assert_eq!(stored, reset_at, "落库的恢复时刻必须是适配器算出的日池重置点");
     // ── 断言「是下一个北京零点」，而不是「距现在 > 10 分钟」（2026-10-13 修）──
     //
     // 原断言写的是 `minutes > 10`，本意是「不是 10 分钟兜底常量」；但它有个
