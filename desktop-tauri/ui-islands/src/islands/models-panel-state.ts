@@ -18,8 +18,10 @@
  * 本页自持内置家那份数据，不经过 app.js 的 state（那是 /api/session 的快照，轮询会整份覆盖）。
  */
 
+import { activeModelBindings } from '../../../ui-shared/models-bindings'
 import { buildIndex as buildReasoningIndex } from './models-reasoning'
 import * as customSource from './models-custom-source'
+import { ALL_CUSTOM } from './models-custom-source'
 import type { CustomProviderRecord, ManageMapping, ManageModel, ManageView } from './models-custom-source'
 import type { SegmentedControlOption } from '@ui'
 import { t } from '../i18n'
@@ -76,7 +78,7 @@ export type SharedWindow = {
   workbuddyDesktop?: {
     getModelManage(): Promise<ManageView | null | undefined>
     addModelMapping(
-      alias: string, target: string, provider: string, reasoning?: string, enabled?: boolean,
+      alias: string, target: string, provider: string, reasoning?: string, enabled?: boolean, create?: boolean,
     ): Promise<ManageView | null | undefined>
     removeModelMapping(alias: string, target: string, provider: string): Promise<ManageView | null | undefined>
     addCustomModel(provider: string, id: string): Promise<ManageView | null | undefined>
@@ -191,12 +193,6 @@ export const MODEL_STATE_OPTIONS: readonly SegmentedControlOption<string>[] = MO
  * 「查不到倍率」与「倍率是 0」是两件事，按 0 参与排序会把未知的顶到最前面。
  */
 const MODEL_SORTS: readonly string[] = ['default', 'rate-asc', 'rate-desc']
-const MODEL_SORT_LABEL: Record<string, string> = {
-  default: t('默认'), 'rate-asc': t('倍率升序'), 'rate-desc': t('倍率降序'),
-}
-export const MODEL_SORT_OPTIONS: readonly SegmentedControlOption<string>[] = MODEL_SORTS.map(value => ({
-  value, label: MODEL_SORT_LABEL[value],
-}))
 
 /* ─── 可见性筛选 ───────────────────────────────── */
 
@@ -271,14 +267,6 @@ const COLUMNS: ColumnDecl[] = [
  * 第三个参数）与数据行（visibleColumns）读同一份过滤结果，不会各画一个样。
  */
 const CUSTOM_HIDDEN_COLUMNS: ReadonlySet<string> = new Set(['rate', 'source', 'visibility'])
-
-/**
- * 左栏「自定义提供商」组那颗「全部」的哨兵 id：选中它时右栏聚合**所有**自定义家的
- * 模型（不含内置家 —— 内置组那颗「全部」用的是 'all'，两颗是并列的两份聚合）。
- * `custom-` 前缀 + 12 位十六进制，与它撞车判据上不可能（isCustom 判前缀但候选名单
- * 只认目录里实有的记录，哨兵不在名单里）。
- */
-const ALL_CUSTOM = 'custom-all'
 
 const EMPTY_VIEW: ManageView = { models: [], mappings: [] }
 
@@ -406,7 +394,10 @@ export function restoreSavedFilters(): void {
   if (saved.provider !== snapshot.provider || saved.state !== snapshot.stateFilter
     || saved.search !== snapshot.search || saved.sort !== snapshot.sort
     || saved.visibility !== snapshot.visibilityFilter) {
-    patch(saved)
+    patch({
+      provider: saved.provider, stateFilter: saved.state, search: saved.search,
+      sort: saved.sort, visibilityFilter: saved.visibility,
+    })
   }
 }
 
@@ -423,6 +414,7 @@ export function resolveProvider(state: PanelState): string {
   const id = state.provider
   if (id === 'all' || id === ALL_CUSTOM) return id
   if (customSource.list().some(provider => provider.id === id)) return id
+  if (state.data?.providers?.some(provider => provider.provider === id)) return id
   if (Array.isArray(state.data?.models) && state.data.models.some(model => (model.provider || '') === id)) return id
   if (!state.data || !directoryReady()) return id
   return 'all'
@@ -495,8 +487,8 @@ function aggregateView(): ManageView {
 /** 当前视图的数据（两个数据源在这里合流，下游渲染 / 搜索 / 候选自动跟着选中的家走） */
 export function viewData(): ManageView {
   const provider = currentProvider()
-  if (customSource.isCustom(provider)) return customViewOf(provider)
   if (provider === ALL_CUSTOM) return aggregateView()
+  if (customSource.isCustom(provider)) return customViewOf(provider)
   return snapshot.data || EMPTY_VIEW
 }
 
@@ -521,13 +513,13 @@ function rebuildReasoningIndex(): void {
   reasoningOf = buildReasoningIndex(mappings())
 }
 
-/**
- * 内置各家的 id → {label, n}（左栏内置组条目）。从**内置全量**（data.models）收集，
- * 不能用 models() —— 后者跟着选中项走，选中某一家的那一刻其余各家的计数会全变 0。
- * （resolveProvider 也读它做「认得出这家」的判定，语义与旧版一致：只认有清单的内置家。）
- */
+/** 家级摘要保留空目录；旧服务端没有摘要时仍从全量模型行统计。 */
 export function builtinRailCounts(): Map<string, { label: string; n: number }> {
   const counts = new Map<string, { label: string; n: number }>()
+  for (const provider of snapshot.data?.providers || []) {
+    if (!provider.provider) continue
+    counts.set(provider.provider, { label: provider.providerLabel || provider.provider, n: 0 })
+  }
   const rows = Array.isArray(snapshot.data?.models) ? snapshot.data.models : []
   for (const model of rows) {
     const key = model.provider || ''
@@ -559,10 +551,7 @@ export function customRailItems(): Map<string, { label: string; n: number }> {
   return counts
 }
 
-/**
- * 左栏当前展示的内置家 id（有清单的家）——「获取模型」弹窗据此组装刷新范围
- * （见 models-fetch-modal.tsx 的 scopeProviders）：模型管理页看不到的家不该出现在刷新结果里。
- */
+/** 左栏内置家 id，含等待获取目录的家；供「获取模型」弹窗组装刷新范围。 */
 function builtinProviders(): string[] {
   return [...builtinRailCounts().keys()]
 }
@@ -572,6 +561,8 @@ function builtinProviders(): string[] {
  * 各家清单有多旧）。数据取自 manage 视图的 `refreshedAt`，与本页「来源」列的悬停提示同源。
  */
 function providerRefreshedAt(providerId: string): number {
+  const summary = snapshot.data?.providers?.find(provider => provider.provider === providerId)
+  if (summary) return Number(summary.refreshedAt) || 0
   const rows = Array.isArray(snapshot.data?.models) ? snapshot.data.models : []
   const hit = rows.find(model => model.provider === providerId)
   return Number(hit?.refreshedAt) || 0
@@ -742,41 +733,89 @@ export function accept(next: unknown): void {
   // 与当前选中哪个视图无关 —— 「自定义 · 全部」聚合里勾了一行内置家模型做批量操作时，
   // 返回的仍是内置 manage 视图，照常落快照
   if (view && Array.isArray(view.models)) {
+    loadSeq++
+    loading = false
     patch({ data: view })
     return
   }
   render()
 }
 
+let writeQueue: Promise<unknown> = Promise.resolve()
+
+function enqueueWrite(run: () => Promise<unknown>): Promise<unknown> {
+  const next = writeQueue.catch(() => undefined).then(run)
+  writeQueue = next
+  return next
+}
+
+function providerView(provider: string): ManageView {
+  return customSource.isCustom(provider) ? customViewOf(provider) : (snapshot.data || EMPTY_VIEW)
+}
+
+export function enabledBindingConflicts(provider: string, alias: string, target: string): Array<{ alias: string; target: string }> {
+  const view = providerView(provider)
+  return activeModelBindings(
+    (view.models || []).filter(model => same(model.provider, provider)),
+    (view.mappings || []).filter(mapping => !mapping.provider || same(mapping.provider, provider)),
+    alias, target,
+  )
+}
+
+export function addModelError(provider: string, id: string): string {
+  const view = providerView(provider)
+  if ((view.models || []).some(model => same(model.provider, provider) && same(model.id, id))) {
+    return t('模型 ID「{id}」已存在，请使用已有模型', { id })
+  }
+  return enabledBindingConflicts(provider, id, id).length
+    ? t('模型 ID「{id}」在该提供商已有启用绑定，请先关闭它再添加', { id }) : ''
+}
+
+export function addMappingError(provider: string, alias: string, target: string): string {
+  const view = providerView(provider)
+  if (same(alias, target) || (view.mappings || []).some(mapping => same(mapping.alias, alias)
+    && same(mapping.target, target) && (!mapping.provider || same(mapping.provider, provider)))) {
+    return t('模型 ID「{id}」已绑定到此上游模型，请直接使用已有绑定', { id: alias })
+  }
+  return enabledBindingConflicts(provider, alias, target).length
+    ? t('模型 ID「{id}」在该提供商已有启用绑定，请先关闭它再添加', { id: alias }) : ''
+}
+
 /** 开关 / 新增 / 改一条绑定（alias == target 时即该模型的默认绑定） */
 export async function writeBinding(
-  provider: string, alias: string, target: string, change: { reasoning?: string; enabled?: boolean },
+  provider: string, alias: string, target: string, change: { reasoning?: string; enabled?: boolean; create?: boolean },
 ): Promise<unknown> {
-  if (customSource.isCustom(provider)) return customSource.setBinding(provider, alias, target, change)
+  if (change.create) {
+    const error = addMappingError(provider, alias, target)
+    if (error) throw new Error(error)
+  }
+  if (customSource.isCustom(provider)) return customSource.setBinding(provider, alias, target, { ...change, create: change.create ?? false })
   const api = shared().workbuddyDesktop
   if (!api) throw new Error(t('后端桥不可用'))
-  return api.addModelMapping(alias, target, provider, change.reasoning, change.enabled)
+  return enqueueWrite(() => api.addModelMapping(alias, target, provider, change.reasoning, change.enabled, change.create ?? false))
 }
 
 export async function writeRemoveMapping(provider: string, alias: string, target: string): Promise<unknown> {
   if (customSource.isCustom(provider)) return customSource.removeMapping(provider, alias, target)
   const api = shared().workbuddyDesktop
   if (!api) throw new Error(t('后端桥不可用'))
-  return api.removeModelMapping(alias, target, provider)
+  return enqueueWrite(() => api.removeModelMapping(alias, target, provider))
 }
 
 export async function writeAddModel(provider: string, id: string): Promise<unknown> {
+  const error = addModelError(provider, id)
+  if (error) throw new Error(error)
   if (customSource.isCustom(provider)) return customSource.addModel(provider, id)
   const api = shared().workbuddyDesktop
   if (!api) throw new Error(t('后端桥不可用'))
-  return api.addCustomModel(provider, id)
+  return enqueueWrite(() => api.addCustomModel(provider, id))
 }
 
 export async function writeRemoveModel(provider: string, id: string): Promise<unknown> {
   if (customSource.isCustom(provider)) return customSource.removeModel(provider, id)
   const api = shared().workbuddyDesktop
   if (!api) throw new Error(t('后端桥不可用'))
-  return api.removeCustomModel(provider, id)
+  return enqueueWrite(() => api.removeCustomModel(provider, id))
 }
 
 /**
@@ -796,7 +835,7 @@ export async function writeCapabilities(
   if (customSource.isCustom(provider)) return customSource.setCapabilities(provider, id, capabilities)
   const api = shared().workbuddyDesktop
   if (!api) throw new Error(t('后端桥不可用'))
-  return api.setModelCapabilities(provider, id, capabilities)
+  return enqueueWrite(() => api.setModelCapabilities(provider, id, capabilities))
 }
 
 /* ─── 行内操作 ───────────────────────────────── */
@@ -987,7 +1026,8 @@ export function closeCapability(): void {
  * 消失、自定义家被删）返回 null，由弹窗提示 + 关闭。
  */
 export function modelRowOf(provider: string, id: string): ManageModel | null {
-  return models().find(model => (model.provider || '') === provider && same(model.id, id)) || null
+  const view = providerView(provider)
+  return (view.models || []).find(model => same(model.provider, provider) && same(model.id, id)) || null
 }
 
 /**
